@@ -7,9 +7,6 @@
 #include <ArduinoOTA.h>
 #include <WebSocketsClient.h>
 #include <DNSServer.h>
-#include <SPI.h>
-#include <nRF24L01.h>
-#include <RF24.h>
 #include "u_macros.h"
 #ifdef RASP_MQTT
 #include <PubSubClient.h>
@@ -39,13 +36,18 @@ void callback(char*, byte*, unsigned int);  //MQTT callback func
 void reconnect(void);     //reconnect to MQTT
 void Relay_setup(void);
 void mqtt_subscribe(void);
+void relay_on(byte);
+void relay_off(byte);
 
 unsigned long startMillis;  //Some global vaiable anywhere in program
 unsigned long currentMillis;
 volatile byte ten_sec_counter = 0;
+volatile byte wifi_reconnect_interval = 3;
+volatile bool wifi_reconnect_elapsed = false;
+volatile bool boot_flag = false;
 
 //const byte D5 = 5;
-const byte RELAY_PIN = 5;
+const byte RELAY_PIN = GPIO_16;
 
 
 void setup() {
@@ -58,18 +60,31 @@ void setup() {
 
   WiFiManager wifiManager;
   wifiManager.setConfigPortalTimeout(180);
-  wifiManager.autoConnect("Flop ESP", "espflopflop");
+  wifiManager.autoConnect("One Relay", "espflopflop");
   //wifiManager.setSTAStaticIPConfig(IPAddress(192,168,1,150), IPAddress(192,168,1,1), IPAddress(255,255,255,0)); // optional DNS 4th argument
   //wifiManager.resetSettings();    //Uncomment to reset the Wifi Manager
 
   while (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Connection Failed! Rebooting...");
-    delay(5000);
-    ESP.restart();
+    if(boot_flag == false) // First Boot
+    {
+      Serial.println("Connection Failed! Rebooting...");
+      delay(5000);
+      ESP.restart();
+    }
+    else   //Not first boot
+    {
+     
+      //Recursively call the setup func
+      setup();
+    }
   }
 
+  //Auto reconnect and Persistent  -> to auto reconenct in lost wifi connection
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(true);
+
   // Hostname defaults to esp8266-[ChipID]
-  ArduinoOTA.setHostname("My Room");
+  ArduinoOTA.setHostname("backyard_esp");
 
   // Password can be set with it's md5 value as well
   // MD5(admin) = 21232f297a57a5a743894a0e4a801fc3
@@ -121,12 +136,21 @@ void setup() {
   //Serial.println("Subscribe Set");
   #endif
 
-  /* Basic Setup */
-  Relay_setup();
+  if(boot_flag == false)
+  {
+    /* Basic Setup */
+    Relay_setup();
 
 
-  //  //Timer start
-  startMillis = millis();
+    //  //Timer start
+    startMillis = millis();
+  }
+
+  //First boot
+  if(boot_flag == false)
+  {
+    boot_flag = true;
+  }
 
 }
 
@@ -137,16 +161,16 @@ void loop()
   /*****OTA Ends **************/
 
   /* Wifi Stuff */
-   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("Reconnecting.");
-    delay(5000);
-    /* If Wifi is not connected, keep on the relay */
-    //ON command
-    //digitalWrite(RELAY_PIN, LOW);
-    WiFi.reconnect();
-  }
-
-  connected = client.connected();
+  //  if (WiFi.status() != WL_CONNECTED) {
+  //   Serial.println("Reconnecting.");
+  //   delay(5000);
+  //   /* If Wifi is not connected, keep on the relay */
+  //   //ON command
+  //   //digitalWrite(RELAY_PIN, LOW);
+  //   WiFi.reconnect();
+  // }
+  
+    connected = client.connected();
   if (!connected) {
     #ifdef RASP_MQTT
     reconnect();
@@ -179,16 +203,17 @@ void callback(char* topic, byte* payload, unsigned int length)
     float f_value = atof(temp_buff);
      if(strcmp(topic,RELAY_TOPIC) == 0)
     {
-        if(f_value == 1)
-        {
-            //ON command
-            digitalWrite(RELAY_PIN, LOW);
-        }
-        else
-        {
-            //Off command
-            digitalWrite(RELAY_PIN, HIGH);
-        }
+      if(f_value == 1)
+      {
+        //ON command
+        relay_on(RELAY_PIN);
+      }
+      else
+      {
+        //OFF Command
+        relay_off(RELAY_PIN);
+      }
+      
     }
     else
     {
@@ -216,19 +241,33 @@ void reconnect() {
 }
 #else
 void reconnect() {
-  // Loop until we're reconnected
-  while (!client.connected()) {
-    Serial.println("Attempting MQTT connection...");
+  if(WiFi.status() != WL_CONNECTED && wifi_reconnect_elapsed == true)
+  {
+    //Wifi is not connected 
+    Serial.println("Reconnecting to WiFi...");
+    //WiFi.disconnect();
+    //WiFi.reconnect();
+    setup();
+    wifi_reconnect_elapsed = false;
+
+  }
+  else if(WiFi.status() == WL_CONNECTED)
+  {
+    //Wifi is connected
+     // Loop until we're reconnected
+    while (!client.connected()) {
+      Serial.println("Attempting MQTT connection...");
     
-    // Attempt to connect
-    if (client.connect(MQTT_CLIENT_NAME, TOKEN,"")) {
-      Serial.println("connected");
-    } else {
-      Serial.print("failed, rc=");
-      Serial.print(client.state());
-      Serial.println(" try again in 2 seconds");
-      // Wait 2 seconds before retrying
-      delay(2000);
+      // Attempt to connect
+      if (client.connect(MQTT_CLIENT_NAME, TOKEN,"")) {
+        Serial.println("connected");
+      } else {
+        Serial.print("failed, rc=");
+        Serial.print(client.state());
+        Serial.println(" try again in 2 seconds");
+        // Wait 2 seconds before retrying
+        delay(2000);
+      }
     }
   }
 }
@@ -236,8 +275,28 @@ void reconnect() {
 void Relay_setup()
 {
   //define relay pins and their state
+  //Need to invrt GPIO16 state for esp 12f brekout board
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH);
+  #ifdef OPTO_COUPLER
+  if(RELAY_PIN != GPIO_16)
+  {
+     digitalWrite(RELAY_PIN, HIGH);
+  }
+  else
+  {
+     digitalWrite(RELAY_PIN, LOW);
+  }
+ 
+  #else
+  if(RELAY_PIN != GPIO_16)
+  {
+     digitalWrite(RELAY_PIN, LOW);
+  }
+  else
+  {
+     digitalWrite(RELAY_PIN, HIGH);
+  }
+  #endif
  
 }
 
@@ -250,10 +309,15 @@ void timer_function()
     ten_sec_counter++;
 
    
-    if ((ten_sec_counter % 60) == 0) //test whether the period has elapsed
+    if ((ten_sec_counter % wifi_reconnect_interval) == 0) //test whether the period has elapsed
     {
       //temp_humd_timer_elapsed = true;
       ten_sec_counter = 0;  //IMPORTANT to save the start time of the current LED state.
+      if(WiFi.status() != WL_CONNECTED)
+      {
+           wifi_reconnect_elapsed = true;
+      }
+     
     }
   }
 
@@ -263,4 +327,53 @@ void mqtt_subscribe()
   //char *topicToSubscribe;
   sprintf(topic, "%s", RELAY_TOPIC);
   client.subscribe(topic);
+}
+
+void relay_on(byte pin){
+  #ifdef OPTO_COUPLER
+  if(pin != GPIO_16)
+  {
+    digitalWrite(pin, LOW);
+  }
+  else
+  {
+    digitalWrite(pin, HIGH);
+  }
+  #else
+  if(pin != GPIO_16)
+  {
+    //No inversion
+    digitalWrite(pin, HIGH);
+  }
+  else
+  {
+    //Inversion
+    digitalWrite(pin, LOW);
+  }
+  #endif
+}
+
+void relay_off(byte pin)
+{
+  #ifdef OPTO_COUPLER
+  if(pin != GPIO_16)
+  {
+    digitalWrite(pin, HIGH);
+  }
+  else
+  {
+    digitalWrite(pin, LOW);
+  }
+  #else
+  if(pin != GPIO_16)
+  {
+    //No inversion
+    digitalWrite(pin, LOW);
+  }
+  else
+  {
+    //Inversion
+    digitalWrite(pin, HIGH);
+  }
+  #endif
 }
